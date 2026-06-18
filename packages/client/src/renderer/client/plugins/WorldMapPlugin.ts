@@ -1,6 +1,7 @@
 import { Plugin } from '@evillite/core/src/interfaces/highlite/plugin/plugin.class';
 import { SettingsTypes, type PluginSettings } from '@evillite/core/src/interfaces/highlite/plugin/pluginSettings.interface';
 import { PluginAssetCache } from '@evillite/core/src/utilities/pluginAssetCache';
+import { ModelIconCache } from '@evillite/core/src/utilities/modelIconCache';
 
 /**
  * World Map plugin for EvilQuest.
@@ -118,14 +119,23 @@ export default class WorldMapPlugin extends Plugin {
     private mapWindowTimer: any = null;
     private mapWindowFullTimer: any = null;
     private mwCloseHooked = false;
+    // Perf: the terrain PNG (toDataURL) is a ~100ms main-thread block; cache it and only regenerate
+    // when the explored terrain actually changed. lastFullSig gates the heavy full-snapshot push so
+    // it doesn't run every 7s for no reason (which froze the game tick → click-to-move "slingshot").
+    private terrainUrl = '';
+    private terrainUrlSig = '';
+    private lastFullSig = '';
+    private mapTerrainTimer: any = null;
+    private terrainEncoding = false;
 
     // ── One viewer, two hosts ─────────────────────────────────────────────────────
     // The SAME HTML viewer (buildMapWindowHtml) runs either in a detached OS window
     // ('window') or an in-page iframe docked over the game ('overlay'). mapMode is the
     // user's remembered preference; the active host is whichever is currently open.
     private mapMode: 'window' | 'overlay' = 'window';
-    private overlayEl: HTMLDivElement | null = null;   // iframe container (overlay host)
+    private overlayEl: HTMLDivElement | null = null;   // overlay host container
     private overlayFrame: HTMLIFrameElement | null = null;
+    private overlayShadow: ShadowRoot | null = null;   // shadow root the viewer runs inside
     private overlayMsgHooked = false;
 
     // ── View state (tile units) ───────────────────────────────────────────────────
@@ -266,9 +276,13 @@ export default class WorldMapPlugin extends Plugin {
                 link.addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    // Open the map (in the user's remembered host) and jump to the coordinate.
-                    this.openMap();
-                    setTimeout(() => this.pushToViewer({ goTo: { x, z } }), 60);
+                    // Open the map if it isn't already open (don't toggle a shown map shut), then
+                    // jump to the coordinate. Re-send the goTo a few times: the overlay iframe can
+                    // take >60ms to be ready on mobile, and its initial fit() would otherwise clobber
+                    // an early goTo and leave the map zoomed all the way out.
+                    if (!this.viewerOpen()) this.openMap();
+                    const go = () => this.pushToViewer({ goTo: { x, z } });
+                    setTimeout(go, 120); setTimeout(go, 450); setTimeout(go, 900);
                 });
 
                 fragment.appendChild(link);
@@ -847,7 +861,7 @@ export default class WorldMapPlugin extends Plugin {
             this.iconsEnabled = f.iconsEnabled ?? true;
             this.labelsEnabled = f.labelsEnabled ?? true;
             this.showMinimapMarkers = f.showMinimapMarkers ?? true;
-            this.mapMode = f.mapMode === 'overlay' ? 'overlay' : 'window';
+            this.mapMode = (this.isMobile || f.mapMode === 'overlay') ? 'overlay' : 'window';
         } catch { /* ignore */ }
     }
     private saveFilterState() {
@@ -1331,8 +1345,16 @@ export default class WorldMapPlugin extends Plugin {
         }
         const W = this.worldW, H = this.worldH;
 
-        // Terrain as a 1px/tile PNG — the viewer scales it the same way the live map does.
-        const terrain = this.worldCanvas.toDataURL('image/png');
+        // Terrain as a 1px/tile PNG. Use the cached copy (refreshed OFF the main thread by
+        // refreshTerrainAsync via toBlob). Encode synchronously ONLY the first time, when nothing is
+        // cached yet (a one-time hit on first open) — never on the per-update path, where the
+        // blocking toDataURL would freeze the game's movement tick (the click-to-move "slingshot").
+        let terrain = this.terrainUrl;
+        if (!terrain) {
+            terrain = this.worldCanvas.toDataURL('image/png');
+            this.terrainUrl = terrain;
+            this.terrainUrlSig = this.worldW + 'x' + this.worldH + ':' + this.lastPaintedSize + ':' + this.currentFloor;
+        }
 
         // Object icons (deduped) + one representative marker per tile (mirrors drawMarkers).
         const iconIdx = new Map<string, number>();
@@ -1494,10 +1516,24 @@ export default class WorldMapPlugin extends Plugin {
      *  playing the game underneath). The window runs the same interactive viewer as the
      *  HTML export; the game renderer streams it live data (player position frequently, a
      *  full snapshot occasionally) over IPC. */
-    /** Entry point (sidebar icon / M-key): open the map in the user's remembered mode. */
+    /** Mobile (Capacitor WebView) has no detached OS window — the map is overlay-only there.
+     *  Set by the mobile shell (window.EvilLiteMobile); also reflected in electron.process.platform. */
+    private get isMobile(): boolean {
+        return !!(window as any).EvilLiteMobile || (window as any).electron?.process?.platform === 'android' || (window as any).electron?.process?.platform === 'ios';
+    }
+
+    /** Entry point (sidebar icon / M-key): toggle the map — open in the user's mode, or close
+     *  if it's already open (re-tap / press M again closes). */
     public openMap(): void {
-        if (this.mapMode === 'overlay') this.openOverlayHost();
+        if (this.viewerOpen()) { this.closeViewer(); return; }
+        if (this.isMobile || this.mapMode === 'overlay') this.openOverlayHost();
         else this.openWindowHost();
+    }
+
+    /** Close whichever host is open. */
+    private closeViewer(): void {
+        if (this.overlayEl) this.closeOverlayHost();
+        if (this.mapWindowOpen) { const ipc = (window as any).electron?.ipcRenderer; ipc?.send('map-window:close'); this.mapWindowOpen = false; }
     }
     /** Back-compat alias (chat-link handoff, older call sites). */
     public openMapWindow(): void { this.openMap(); }
@@ -1521,28 +1557,79 @@ export default class WorldMapPlugin extends Plugin {
         this.info('map opened (window).');
     }
 
-    /** Host B — in-page iframe docked over the game (postMessage transport). Same viewer. */
+    /** Host B — in-page overlay docked over the game, rendered in a SHADOW ROOT (not an iframe).
+     *
+     *  Why shadow DOM, not an iframe: the game's anti-bot input-ticket system listens for trusted
+     *  pointerdowns on the game `window` (window.addEventListener('pointerdown',_,true)) and mints an
+     *  input ticket the next command borrows. A click inside an iframe fires on the iframe's SEPARATE
+     *  window, which the game never sees — so iframe click-to-move ships with inputSeq=0 and the server
+     *  rejects it (the "slingshot"). A shadow root lives in the GAME's document: your real click is a
+     *  trusted pointerdown the game DOES register, and our synchronous move (sendInput → __wmInlineSend
+     *  → handleMapWindowInput, all in the click's call stack) rides that genuine ticket. Same CSS
+     *  isolation as the iframe, but the click is real and in-context — nothing faked. */
     private openOverlayHost(): void {
-        if (this.overlayEl) { try { this.overlayFrame?.contentWindow?.focus(); } catch { /* ignore */ } return; }
+        if (this.overlayEl) return;
         this.refreshData();
         const snap = this.buildMapSnapshot();
         if (!snap) { this.warn('map: data not ready (log in / move around first)'); return; }
+        const full = this.buildMapWindowHtml(snap, 'overlay');
+        // Split the self-contained viewer document into its <style>, body markup, and <script> IIFE.
+        const css = (full.match(/<style>([\s\S]*?)<\/style>/) || [, ''])[1];
+        const markup = (full.match(/<body>([\s\S]*?)<script>/) || [, ''])[1];
+        const script = (full.match(/<script>([\s\S]*?)<\/script><\/body>/) || [, ''])[1];
+
         const el = document.createElement('div');
         el.id = 'eq-wm-overlay';
-        Object.assign(el.style, { position: 'fixed', top: '40px', left: '40px', right: '40px', bottom: '40px', zIndex: '2147483640', boxShadow: '0 6px 28px rgba(0,0,0,.6)', border: '1px solid #333', borderRadius: '6px', overflow: 'hidden', background: '#101012' });
-        const f = document.createElement('iframe');
-        Object.assign(f.style, { width: '100%', height: '100%', border: '0', display: 'block' });
-        f.srcdoc = this.buildMapWindowHtml(snap, 'overlay');
-        el.appendChild(f);
+        const m = this.isMobile;
+        Object.assign(el.style, m
+            ? { position: 'fixed', inset: '0', zIndex: '2147483640', overflow: 'hidden', background: '#101012' }
+            : { position: 'fixed', top: '40px', left: '40px', right: '40px', bottom: '40px', zIndex: '2147483640', boxShadow: '0 6px 28px rgba(0,0,0,.6)', border: '1px solid #333', borderRadius: '6px', overflow: 'hidden', background: '#101012' });
+        const root = el.attachShadow({ mode: 'open' });
+        // The viewer assumes a <body> (base styles + `body.side-open #side` + body.classList toggles).
+        // A shadow root has no body and ShadowRoot has no classList, so wrap the markup in #wmbody
+        // and retarget that one selector. :host carries the base typography the original put on body.
+        const cssFixed = css.replace(/body\.side-open/g, '#wmbody.side-open');
+        root.innerHTML = '<style>:host{display:block;background:#101012;color:#e8e8e8;font:13px/1.4 Inter,system-ui,sans-serif;overflow:hidden}'
+            + '#wmbody{height:100%;display:block}#app{height:100%!important}'
+            + cssFixed + '</style><div id="wmbody">' + markup + '</div>';
         document.body.appendChild(el);
-        this.overlayEl = el; this.overlayFrame = f;
+        this.overlayEl = el; this.overlayShadow = root; this.overlayFrame = null;
+
+        // Synchronous, in-context move dispatch so the click rides its own freshly-minted input ticket.
+        (window as any).__wmInlineSend = (msg: any) => this.handleMapWindowInput(msg);
         this.hookOverlayMessages();
-        f.addEventListener('load', () => { const s = this.buildMapSnapshot(); if (s) this.postToOverlay({ full: s, p: s.p }); });
+        // Run the viewer script with `document` scoped to the shadow root (so its getElementById/
+        // querySelector hit the overlay's own DOM, not the game's).
+        try {
+            // eslint-disable-next-line no-new-func
+            new Function('document', script)(this.makeShadowDocShim(root));
+        } catch (e) { this.warn('overlay viewer failed: ' + e); }
+        this.postToOverlay({ full: snap, p: snap.p });
         this.startMapWindowUpdates();
         this.info('map opened (overlay).');
     }
 
-    /** Receive input (click-move / floor / mode / close) posted by the overlay iframe. */
+    /** A minimal `document` shim that points element lookups at the overlay's shadow root while
+     *  leaving element creation / global event registration on the real document. */
+    private makeShadowDocShim(root: ShadowRoot): any {
+        const real = document;
+        return {
+            getElementById: (id: string) => root.getElementById(id),
+            querySelector: (s: string) => root.querySelector(s),
+            querySelectorAll: (s: string) => root.querySelectorAll(s),
+            createElement: (t: string) => real.createElement(t),
+            createElementNS: (ns: string, t: string) => real.createElementNS(ns, t),
+            createTextNode: (t: string) => real.createTextNode(t),
+            // body → the #wmbody wrapper (a real element with classList); head → the shadow root
+            // (so injected <style> stays scoped to the overlay, not leaked into the game).
+            get body() { return (root.getElementById('wmbody') || root) as any; },
+            get head() { return root as any; },
+            addEventListener: (...a: any[]) => (real.addEventListener as any)(...a),
+            removeEventListener: (...a: any[]) => (real.removeEventListener as any)(...a),
+        };
+    }
+
+    /** Receive input (click-move / floor / mode / close) from the overlay viewer. */
     private hookOverlayMessages(): void {
         if (this.overlayMsgHooked) return;
         this.overlayMsgHooked = true;
@@ -1554,21 +1641,26 @@ export default class WorldMapPlugin extends Plugin {
 
     private closeOverlayHost(): void {
         if (this.overlayEl) { try { this.overlayEl.remove(); } catch { /* ignore */ } }
-        this.overlayEl = null; this.overlayFrame = null;
+        this.overlayEl = null; this.overlayFrame = null; this.overlayShadow = null;
+        try { delete (window as any).__wmInlineSend; } catch { /* ignore */ }
         if (!this.mapWindowOpen) this.stopMapWindowUpdates();
     }
 
     private postToOverlay(payload: any): void {
+        // Shadow viewer runs in the game window — deliver data updates via a window message it
+        // already listens for. (Async is fine for data; only the MOVE must be synchronous.)
+        if (this.overlayShadow) { try { window.postMessage({ __wmUpdate: payload }, '*'); } catch { /* ignore */ } return; }
         try { this.overlayFrame?.contentWindow?.postMessage({ __wmUpdate: payload }, '*'); } catch { /* ignore */ }
     }
     /** Push a data payload to whichever host(s) are currently open. */
     private pushToViewer(payload: any): void {
         if (this.mapWindowOpen) { const ipc = (window as any).electron?.ipcRenderer; ipc?.send('map-window:update', payload); }
-        if (this.overlayFrame) this.postToOverlay(payload);
+        if (this.overlayShadow) this.postToOverlay(payload);
     }
 
     /** The ⇄ toggle: switch between window and overlay hosts, remembering the choice. */
     private switchMode(): void {
+        if (this.isMobile) return; // overlay-only on mobile — no detached OS window to switch to
         const target: 'window' | 'overlay' = this.mapMode === 'window' ? 'overlay' : 'window';
         if (this.mapMode === 'window' && this.mapWindowOpen) {
             const ipc = (window as any).electron?.ipcRenderer; ipc?.send('map-window:close'); this.mapWindowOpen = false;
@@ -1602,6 +1694,26 @@ export default class WorldMapPlugin extends Plugin {
         this.info('map window re-attached after reload.');
     }
 
+    /** Hand a click-to-move to the game — SYNCHRONOUSLY, from within the user's real click.
+     *
+     *  The slingshot was an anti-bot rejection, not a movement bug: the game stamps each command
+     *  with an inputSeq from a ticket minted by a trusted browser pointerdown the game's own
+     *  window-capture listener sees. A move with no ticket ships inputSeq=0 and the server discards
+     *  it as an inputless (bot) command → snapback. So this MUST run in the same call stack as the
+     *  real click (overlay shadow-DOM → sendInput → __wmInlineSend → here), inside the 350ms input
+     *  ticket burst, so it borrows the genuine click's ticket. Any deferral (timers, queues) fires
+     *  outside the burst → inputSeq=0 → rejected, which is why earlier attempts failed.
+     *
+     *  Only valid from the overlay: there the click is a real, in-renderer pointerdown the game
+     *  registers. The popout window is a separate renderer the game never sees, so its clicks can't
+     *  be authorized — it's view-only (faking that authorization would be defeating the anti-bot
+     *  system, which we don't do). */
+    private dispatchMapMove(worldX: number, worldZ: number): void {
+        if (!this.overlayShadow) return; // popout window = view-only (no real in-renderer click)
+        const gm = this.gm;
+        gm?.minimap?.onClickMove?.(worldX, worldZ, worldX, worldZ);
+    }
+
     /** Apply an action forwarded from the detached map window back to the live game. */
     private handleMapWindowInput(msg: any): void {
         if (!msg) return;
@@ -1612,10 +1724,17 @@ export default class WorldMapPlugin extends Plugin {
             if (player) {
                 const dx = worldX - player.x, dz = worldZ - player.z;
                 const dist = Math.sqrt(dx * dx + dz * dz);
-                const MAX = 80;
-                if (dist > MAX) { const r = MAX / dist; worldX = player.x + dx * r; worldZ = player.z + dz * r; }
+                // Clamp a far click to the game's overlay reach. The slingshot is solved (a shadow-DOM
+                // click now mints a real input ticket — see [[project_map_movement_inputticket]]), so
+                // this is no longer a desync workaround, just keeping a single click within what one
+                // move can express: the client's MAX_OVERLAY_DIST_SQ = 2025 → √ = 45 tiles, and the
+                // move packet caps at 50 path nodes (sendMove: Math.min(t.length,50)). 45 is the
+                // game's named overlay distance and sits safely under the send cap. Click again to
+                // keep walking past it.
+                const MAX_CLICK_DIST = 45; // √(GameManager MAX_OVERLAY_DIST_SQ = 2025)
+                if (dist > MAX_CLICK_DIST) { const r = MAX_CLICK_DIST / dist; worldX = player.x + dx * r; worldZ = player.z + dz * r; }
             }
-            if (this.gm?.minimap?.onClickMove) this.gm.minimap.onClickMove(worldX, worldZ, worldX, worldZ);
+            this.dispatchMapMove(worldX, worldZ);
         } else if (msg.t === 'floor') {
             const f = Math.max(0, Math.min(8, msg.f | 0));
             if (f !== this.currentFloor) {
@@ -1640,6 +1759,10 @@ export default class WorldMapPlugin extends Plugin {
             } else {
                 this.setStatus('Chat input not found.');
             }
+            // After sharing, close the map if it's the in-page OVERLAY so the chat (+ the
+            // shared link) is visible underneath — always the case on mobile. A detached
+            // WINDOW/popout doesn't block chat, so it stays open.
+            if (this.overlayEl) this.closeOverlayHost();
         }
     }
 
@@ -1657,18 +1780,53 @@ export default class WorldMapPlugin extends Plugin {
             const pl = this.players.map((q) => ({ x: q.x, z: q.z, n: q.name }));
             this.pushToViewer({ p: p ? { x: p.x, z: p.z } : null, npc, pl, online: !!p, dest: this.getMoveDest() });
         }, 280);
-        // Occasional + heavy: push a full snapshot to pick up newly explored terrain/markers.
+        // Occasional + heavy: full snapshot — but ONLY when the MARKERS change (a new object/NPC
+        // type), NOT on every explored tile. buildMapSnapshot's terrain encode + serialization is a
+        // ~100ms main-thread block; running it as you walk (explored-tile count always growing) froze
+        // the game's movement tick and snapped the player back (the click-to-move "slingshot").
         this.mapWindowFullTimer = setInterval(() => {
             if (!this.viewerOpen()) return;
             this.refreshData();
+            const sig = this.objectStore.size + ':' + this.liveEphemeral.length + ':' + this.currentFloor;
+            if (sig === this.lastFullSig) return; // markers unchanged → skip the heavy rebuild/push
+            this.lastFullSig = sig;
             const snap = this.buildMapSnapshot();
             if (snap) this.pushToViewer({ full: snap, p: snap.p });
         }, 7000);
+        // Terrain is refreshed on its own timer and encoded OFF the main thread (toBlob), so newly
+        // explored tiles appear without ever blocking the game's movement tick.
+        this.mapTerrainTimer = setInterval(() => {
+            if (!this.viewerOpen()) return;
+            this.refreshTerrainAsync();
+        }, 5000);
     }
 
     private stopMapWindowUpdates(): void {
         if (this.mapWindowTimer) { clearInterval(this.mapWindowTimer); this.mapWindowTimer = null; }
         if (this.mapWindowFullTimer) { clearInterval(this.mapWindowFullTimer); this.mapWindowFullTimer = null; }
+        if (this.mapTerrainTimer) { clearInterval(this.mapTerrainTimer); this.mapTerrainTimer = null; }
+    }
+
+    /** Re-encode the terrain PNG OFF the main thread (canvas.toBlob is async, unlike the blocking
+     *  toDataURL) and stream it to the viewer when explored tiles have changed — so the map fills in
+     *  as you walk without ever freezing the game's movement tick. */
+    private refreshTerrainAsync(): void {
+        if (this.terrainEncoding) return;
+        const cm = this.getChunkManager();
+        if (!cm || !this.rebuildWorldCanvas(cm) || !this.worldCanvas) return;
+        const sig = this.worldW + 'x' + this.worldH + ':' + this.lastPaintedSize + ':' + this.currentFloor;
+        if (sig === this.terrainUrlSig) return; // unchanged → nothing to send
+        this.terrainEncoding = true;
+        try {
+            this.worldCanvas.toBlob((blob) => {
+                this.terrainEncoding = false;
+                if (!blob) return;
+                const fr = new FileReader();
+                fr.onload = () => { this.terrainUrl = fr.result as string; this.terrainUrlSig = sig; this.pushToViewer({ terrain: this.terrainUrl }); };
+                fr.onerror = () => {};
+                fr.readAsDataURL(blob);
+            }, 'image/png');
+        } catch { this.terrainEncoding = false; }
     }
 
     /** A self-contained interactive viewer that re-renders the exported data exactly like
@@ -1727,8 +1885,8 @@ export default class WorldMapPlugin extends Plugin {
 + 'var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}'
 + 'if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});'
 + 'view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});'
-+ 'view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){if(!m.contains(ev.target)){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});'
-+ 'function goTo(x,z){Z=Math.max(Z,12);cx=x+0.5;cz=z+0.5;render();}'
++ 'view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){var pth=(ev.composedPath&&ev.composedPath())||[];if(!m.contains(ev.target)&&pth.indexOf(m)<0){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});'
++ 'function goTo(x,z){Z=Math.max(Z,16);cx=x+0.5;cz=z+0.5;render();}'
 + 'function buildTax(){var box=document.getElementById("cats");box.innerHTML="";var esc=function(t){var d=document.createElement("span");d.textContent=t;return d.innerHTML;};'
 + 'var catIcon={},nameIcon={};D.ob.forEach(function(o){if(o.i>=0){if(catIcon[o.c]===undefined)catIcon[o.c]=o.i;if(nameIcon[o.c+"|"+o.n]===undefined)nameIcon[o.c+"|"+o.n]=o.i;}});'
 + 'var swatch=function(i,col){return i!==undefined?"<img class=ci src=\\""+D.ic[i]+"\\">":"<span class=sw style=background:"+col+"></span>";};'
@@ -1809,11 +1967,12 @@ html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 In
 <div id="view"><canvas id="c"></canvas><div id="tip"></div><div id="hint">drag to pan · scroll to zoom · click to walk</div><div id="loading"><div class="lspin"></div><div>Loading map…</div></div></div></div></div>
 <script>(function(){var D=${json};
 var HOST=${JSON.stringify(host)};
+var MOBILE=${this.isMobile};
 /* One viewer, two hosts: a detached BrowserWindow talks over IPC; an in-page iframe overlay
    talks over postMessage. sendInput()/applyUpdate() abstract the transport so the rest of the
    viewer is identical in both. */
 var IPC=(window.electron&&window.electron.ipcRenderer)?window.electron.ipcRenderer:null;
-function sendInput(m){if(IPC){IPC.send("map-window:input",m);}else{try{parent.postMessage({__wmInput:m},"*");}catch(e){}}}
+function sendInput(m){if(window.__wmInlineSend){window.__wmInlineSend(m);return;}if(IPC){IPC.send("map-window:input",m);}else{try{parent.postMessage({__wmInput:m},"*");}catch(e){}}}
 var view=document.getElementById("view"),cv=document.getElementById("c"),ctx=cv.getContext("2d"),tip=document.getElementById("tip"),q=document.getElementById("q");
 var terrain,ICONS,MM,ICONS_S;
 function loadImgs(){terrain=new Image();terrain.onload=function(){var l=document.getElementById("loading");if(l)l.style.display="none";baseSig="";requestRender();};terrain.src=D.t;ICONS=(D.ic||[]).map(function(s){var i=new Image();i.src=s;return i;});ICONS_S=new Array(ICONS.length);MM=(D.mm||[]).map(function(s){var i=new Image();i.src=s;return i;});}
@@ -1894,7 +2053,7 @@ ctx.save();ctx.lineWidth=Math.max(2,Z*0.16);ctx.strokeStyle="rgba(255,226,72,"+(
 for(var i=0;i<pingPts.length;i++){var px=(pingPts[i][0]-sl)*Z,py=(pingPts[i][1]-st)*Z;if(px<-40||px>W+40||py<-40||py>Hh+40)continue;ctx.beginPath();ctx.arc(px,py,rad,0,6.28);ctx.stroke();}
 ctx.restore();}
 function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}
-function goTo(x,z){Z=Math.max(Z,12);cx=x+0.5;cz=z+0.5;render();}
+function goTo(x,z){Z=Math.max(Z,16);cx=x+0.5;cz=z+0.5;render();}
 /* Drag-vs-click (option C): panning only engages on a deliberate drag — moved past a
    generous threshold AND held a moment (or a big fast sweep). A quick tap, even with a few
    px of drift, stays a click → walk there. Click-to-move is handled on mouseup, not the
@@ -1904,14 +2063,14 @@ function clickAt(e){var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.
 var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);var wx=sl+mx/Z,wz=st+my/Z;
 if(best){var m=best.s.match(/(-?\\d+),(-?\\d+)/);if(m){goTo(parseInt(m[1]),parseInt(m[2]));}}
-else if(D.online){sendInput({t:"move",x:Math.round(wx),z:Math.round(wz)});}}
+else if(D.online){sendInput({t:"move",x:wx,z:wz});}}
 view.addEventListener("mousedown",function(e){if(e.button!==0)return;pressed=true;dragging=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;pressT=Date.now();});
-window.addEventListener("mouseup",function(e){if(pressed&&!dragging&&e.target&&(view===e.target||view.contains(e.target)))clickAt(e);pressed=false;dragging=false;view.classList.remove("drag");});
+window.addEventListener("mouseup",function(e){var pth=(e.composedPath&&e.composedPath())||[];var onView=view===e.target||view.contains(e.target)||pth.indexOf(view)>=0;if(pressed&&!dragging&&onView)clickAt(e);pressed=false;dragging=false;view.classList.remove("drag");});
 view.addEventListener("mousemove",function(e){if(pressed){if(!dragging){var dist=Math.abs(e.clientX-sx0)+Math.abs(e.clientY-sy0);if((dist>DRAG_THRESH&&(Date.now()-pressT)>HOLD_MS)||dist>DRAG_THRESH*3){dragging=true;setFollow(false);view.classList.add("drag");}}if(dragging){cx-=(e.clientX-lx0)/Z;cz-=(e.clientY-ly0)/Z;lx0=e.clientX;ly0=e.clientY;requestRender();tip.style.display="none";}return;}
 var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});
 view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});
-view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){if(!m.contains(ev.target)){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});
+view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){var pth=(ev.composedPath&&ev.composedPath())||[];if(!m.contains(ev.target)&&pth.indexOf(m)<0){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});
 function setFollow(on){follow=on&&!!D.online;var b=document.getElementById("follow");b.className="btn"+(D.online?"":" dis")+(follow?"":" off");b.innerText=(follow?"◉":"○")+" Follow";if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;render();}}
 document.getElementById("follow").onclick=function(){if(!D.online)return;setFollow(!follow);};
 document.getElementById("fdown").onclick=function(){sendInput({t:"floor",f:(D.floor||0)-1});};
@@ -1947,6 +2106,7 @@ g.appendChild(head);g.appendChild(subs);box.appendChild(g);});}
 function setLabel(){document.getElementById("fl").innerText="Floor "+(D.floor||0);}
 function applyUpdate(u){if(!u)return;
 if(u.full){var nd=u.full;D=nd;loadImgs();taxState();buildNpcIcon();buildCats();setLabel();dataVer++;}
+if(u.terrain){D.t=u.terrain;terrain=new Image();terrain.onload=function(){baseSig="";requestRender();};terrain.src=u.terrain;}
 if(u.p!==undefined)D.p=u.p;if(u.npc!==undefined)D.npc=u.npc;if(u.pl!==undefined)D.pl=u.pl;if(u.online!==undefined)D.online=u.online;
 if(u.dest!==undefined){var had=!!D.dest;D.dest=u.dest;if(D.dest&&!had)destT0=performance.now();}
 setFollow(follow);if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}if(u.goTo){setFollow(false);goTo(u.goTo.x,u.goTo.z);}ensureDestAnim();requestRender();}
@@ -1954,6 +2114,37 @@ if(IPC&&IPC.on)IPC.on("map-window:update",function(e,u){applyUpdate(u);});
 window.addEventListener("message",function(e){var d=e&&e.data;if(d&&d.__wmUpdate)applyUpdate(d.__wmUpdate);});
 buildCats();setLabel();setFollow(true);ensureDestAnim();
 window.addEventListener("resize",resize);[terrain].concat(ICONS,MM).forEach(function(im){im.addEventListener("load",requestRender);});setTimeout(render,300);setTimeout(render,1200);
+if(MOBILE){(function(){
+var ms=document.createElement("style");ms.textContent=
+"#hdr h1{display:none}#hdr{flex-wrap:wrap;gap:5px;padding:5px 8px}"
++"#q{flex:1 1 120px;font-size:15px;padding:7px 8px}#modeToggle{display:none!important}"
++".btn{padding:7px 10px;font-size:13px}#hint{display:none}#body{position:relative}"
++"#side{position:absolute;left:0;top:0;bottom:0;z-index:7;max-width:80%;overflow:auto;transform:translateX(-100%);transition:transform .2s;box-shadow:2px 0 12px rgba(0,0,0,.5)}"
++"body.side-open #side{transform:translateX(0)}"
++"#legendToggle{position:absolute;left:8px;top:8px;z-index:8;width:40px;height:40px;border:none;border-radius:8px;background:rgba(20,20,24,.85);color:#fff;font-size:20px;cursor:pointer}"
++"#zoomBtns{position:absolute;right:10px;bottom:14px;z-index:8;display:flex;flex-direction:column;gap:10px}"
++"#zoomBtns button{width:46px;height:46px;border:none;border-radius:10px;background:rgba(20,20,24,.85);color:#fff;font-size:24px;cursor:pointer}";
+document.head.appendChild(ms);
+var lt=document.createElement("button");lt.id="legendToggle";lt.textContent="\\u2630";lt.onclick=function(){document.body.classList.toggle("side-open");};view.appendChild(lt);
+var zb=document.createElement("div");zb.id="zoomBtns";var zi=document.createElement("button");zi.textContent="+";var zo=document.createElement("button");zo.textContent="\\u2212";zb.appendChild(zi);zb.appendChild(zo);view.appendChild(zb);
+function zoomBy(f){Z=clamp(Z*f,0.3,48);render();}zi.onclick=function(){zoomBy(1.4);};zo.onclick=function(){zoomBy(1/1.4);};
+var tP=false,tD=false,x0=0,y0=0,lx=0,ly=0,lp=null,pin=false,pd=0,pz=0;
+view.addEventListener("touchstart",function(e){
+ if(e.touches.length===2){pin=true;tP=false;if(lp){clearTimeout(lp);lp=null;}var a=e.touches[0],b=e.touches[1];pd=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);pz=Z;return;}
+ var t=e.touches[0];tP=true;tD=false;x0=lx=t.clientX;y0=ly=t.clientY;
+ if(lp)clearTimeout(lp);lp=setTimeout(function(){if(tP&&!tD){tP=false;view.dispatchEvent(new MouseEvent("contextmenu",{clientX:x0,clientY:y0,bubbles:true,cancelable:true}));}},500);
+},{passive:true});
+view.addEventListener("touchmove",function(e){
+ if(pin&&e.touches.length>=2){var a=e.touches[0],b=e.touches[1];var d=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);if(pd>0){Z=clamp(pz*(d/pd),0.3,48);render();}e.preventDefault();return;}
+ if(!tP)return;var t=e.touches[0];var dd=Math.abs(t.clientX-x0)+Math.abs(t.clientY-y0);
+ if(!tD&&dd>12){tD=true;if(lp){clearTimeout(lp);lp=null;}setFollow(false);}
+ if(tD){cx-=(t.clientX-lx)/Z;cz-=(t.clientY-ly)/Z;lx=t.clientX;ly=t.clientY;requestRender();tip.style.display="none";e.preventDefault();}
+},{passive:false});
+view.addEventListener("touchend",function(e){if(lp){clearTimeout(lp);lp=null;}
+ if(pin){if(e.touches.length===0)pin=false;return;}
+ if(tP&&!tD){clickAt({clientX:x0,clientY:y0});}tP=false;tD=false;
+},{passive:true});
+})();}
 resize();fit();})();</script></body></html>`;
     }
 
@@ -1977,9 +2168,10 @@ resize();fit();})();</script></body></html>`;
     // Icons render lazily on demand, are cached, and replace the colour/shape markers.
     private iconsEnabled = true;
     private iconCache = new Map<string, HTMLImageElement>();
-    /** Build-committed cache of rendered model icons, via the generic core asset
-     *  cache (main-process file under data/world-map-icons.json). */
-    private iconCacheStore = new PluginAssetCache('world-map-icons');
+    /** Rendered model icons live in the CORE-managed shared 'model-icons' namespace
+     *  (data/model-icons.json) so any plugin can read them — the map is just the
+     *  producer (it can render the 3D models). See ModelIconCache. */
+    private iconCacheStore = new ModelIconCache();
     /** Build-committed prebake of explored terrain (per map+floor), via the same core
      *  asset cache (data/world-map-terrain.json). Packaged users load a full map up
      *  front; in dev it re-bakes as you explore so the shipped cache can be updated. */
@@ -2039,6 +2231,10 @@ resize();fit();})();</script></body></html>`;
         this.bjsState = 'init';
         try {
             await this.loadPersistedIcons();
+            // Mobile: use the prebaked (APK-bundled) cache ONLY. Never spin up the offscreen Babylon
+            // engine to render icons live — a second WebGL context blanks the game's 3D view. Uncached
+            // icons fall back to coloured dots.
+            if (this.isMobile) { this.bjsState = 'failed'; this.info('icons: mobile — prebaked cache only (no live render)'); return; }
             const gm = this.gm;
             if (!gm?.scene) { this.bjsState = 'idle'; return; } // not in game yet — retry later
             let url = '';
@@ -2336,6 +2532,10 @@ resize();fit();})();</script></body></html>`;
     private static readonly HUMANOID_MODEL = '/Character models/main character.glb';
 
     private getNpcIcon(defId: number): HTMLImageElement | null {
+        // Cache-first: a prebaked npc:<defId> icon wins directly. On mobile the live model tables
+        // aren't built (no live rendering), so without this every NPC fell back to the humanoid icon.
+        const cached = this.iconFor('npc:' + defId, () => null);
+        if (cached) return cached;
         const file = this.modelFileFor('npc', defId);
         if (file) return this.iconFor('npc:' + defId, () => file);
 
