@@ -246,6 +246,12 @@ app.on("ready", async () => {
                     // duplicate declaration and kills every hook).
                     exposeCode += `if (!window.__eqSourceModules) window.__eqSourceModules = [];\n`;
                     exposeCode += `window.__eqSourceModules.push(${JSON.stringify(body + "\n")});\n`;
+                    // Index-aligned chunk URL for each captured module. Lets the Reflector locate
+                    // a chunk structurally by name (e.g. the GameManager entry is shipped as
+                    // `GameManager-<hash>.js` — the `[name]` is stable across builds, only the hash
+                    // rotates) instead of fingerprinting to find it. __eqSourceUrls[i] ⟷ __eqSourceModules[i].
+                    exposeCode += `if (!window.__eqSourceUrls) window.__eqSourceUrls = [];\n`;
+                    exposeCode += `window.__eqSourceUrls.push(${JSON.stringify(fullUrl)});\n`;
                     exposeCode += `if (window.onEqModuleLoaded) window.onEqModuleLoaded();\n`;
                     body += exposeCode;
 
