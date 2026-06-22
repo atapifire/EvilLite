@@ -15,6 +15,7 @@
 
 import { Highlite } from '@evillite/core'
 import { Reflector } from '@evillite/core'
+import { reflectorTick } from '@evillite/core/src/reflector/reflectorRuntime'
 import { HighliteResources } from '@evillite/core';
 import '@iconify/iconify';
 import '@static/css/index.css';
@@ -261,6 +262,11 @@ async function obtainGameClient() {
     let stableTicks = 0;
     let lastParsedCount = -1;
     const settleTimer = setInterval(() => {
+        // New runtime resolver (Layer 2/3): signature + chunk-anchor matching over the
+        // captured document.client registry. Self-gates on captured-chunk growth, binds
+        // cooperatively into gameHooks alongside the legacy parse. See reflector/resolver.ts.
+        try { reflectorTick(); } catch (e) { console.warn('[Reflector] tick error', e); }
+
         const modules = (window as any).__eqSourceModules;
         const count = Array.isArray(modules) ? modules.length : 0;
         // Readiness signal: the GameManager bundle is present in the captured source.
