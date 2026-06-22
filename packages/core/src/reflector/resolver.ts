@@ -5,19 +5,21 @@
  * that the capture layer registered into `document.client` (name -> Class), plus the
  * index-aligned chunk URLs in `window.__eqSourceUrls` / `window.__eqSourceModules`.
  *
- * Two rename-proof techniques:
- *   - `chunk`: a structural anchor — match a class by the chunk filename it ships in
- *     (e.g. GameManager is in `GameManager-<hash>.js`; the [name] is stable, the hash
- *     rotates). Best for the entry point, which everything else hangs off.
- *   - `members` + `threshold`: fuzzy N-of-M match on prototype members. A class matches
- *     if ≥ threshold of its signature members are present AND it's the unique best match.
- *     Survives a method rename or two; refuses to bind on a tie (loud, never silent).
+ * Entry-point discovery is a 3-tier cascade (each more general, less precise):
+ *   1. chunk-name anchor  — match the chunk filename the class ships in
+ *                           (GameManager-<hash>.js; [name] stable, hash rotates). Fast.
+ *   2. import-graph walk  — if (1) misses (EQ stopped naming chunks), parse the entry
+ *                           chunk's dynamic `import("./X.js")` edges, narrow to the
+ *                           classes in those boot-imported chunks, then fuzzy-pick.
+ *   3. all-classes fuzzy  — last resort: fuzzy N-of-M over the whole registry.
+ *
+ * Leaf classes (no `chunk`) just use tier 3 directly.
  */
 
 export interface Signature {
-    /** Distinctive prototype members (methods + getters) that identify the class. */
+    /** Distinctive prototype members (methods + getters) for fuzzy matching. */
     members?: string[];
-    /** Fraction of `members` that must be present to count as a match. Default 0.6. */
+    /** Fraction of `members` that must be present. Default 0.6. */
     threshold?: number;
     /** Structural anchor: identify the class by the chunk filename it ships in. */
     chunk?: RegExp;
@@ -26,13 +28,16 @@ export interface Signature {
 export interface ResolveResult {
     name: string;
     cls: any | null;
-    /** 'chunk' | 'fuzzy' | 'none' | 'ambiguous' — for diagnostics. */
+    /** 'chunk' | 'import-graph' | 'fuzzy' | 'none' | 'ambiguous' — diagnostics. */
     via: string;
-    /** The minified key it resolved to (changes every build; diagnostics only). */
+    /** Minified key it resolved to (rotates every build; diagnostics only). */
     key?: string;
 }
 
 type ClientRegistry = Map<string, any>;
+interface Candidate { key: string; cls: any; }
+
+const g = () => globalThis as any;
 
 /** Union of all member names across a class's prototype chain (methods + getters). */
 export function classMembers(cls: any): Set<string> {
@@ -47,47 +52,74 @@ export function classMembers(cls: any): Set<string> {
     return out;
 }
 
-/**
- * Live classes declared in any captured chunk whose URL matches `re`.
- * Reads the class names out of the chunk source and looks them up in the registry,
- * so we only return classes that actually exist at runtime.
- */
-export function classesInChunk(re: RegExp, client: ClientRegistry): { key: string; cls: any }[] {
-    const w = globalThis as any;
-    const urls: string[] = w.__eqSourceUrls ?? [];
-    const mods: string[] = w.__eqSourceModules ?? [];
-    const out: { key: string; cls: any }[] = [];
-    for (let i = 0; i < urls.length; i++) {
-        if (!re.test(urls[i])) continue;
-        for (const m of (mods[i] ?? '').matchAll(/\bclass\s+([A-Za-z0-9_$]+)/g)) {
-            const cls = client.get(m[1]);
-            if (cls) out.push({ key: m[1], cls });
-        }
+/** Bare filename (no path, no query) of a chunk URL. */
+function fileOf(url: string): string {
+    return (url.split('/').pop() ?? '').split('?')[0];
+}
+
+/** Live classes declared in captured chunk i, looked up in the runtime registry. */
+function classesInModule(i: number, client: ClientRegistry): Candidate[] {
+    const mods: string[] = g().__eqSourceModules ?? [];
+    const out: Candidate[] = [];
+    for (const m of (mods[i] ?? '').matchAll(/\bclass\s+([A-Za-z0-9_$]+)/g)) {
+        const cls = client.get(m[1]);
+        if (cls) out.push({ key: m[1], cls });
     }
     return out;
 }
 
-/** Resolve one signature to exactly one class. Logs (and returns null) on no-match/ambiguity. */
-export function resolveOne(name: string, sig: Signature, client: ClientRegistry): ResolveResult {
-    // 1. structural anchor first — most rename-proof, and the chunk may carry one dominant class.
-    if (sig.chunk) {
-        const inChunk = classesInChunk(sig.chunk, client);
-        if (inChunk.length) {
-            // pick the dominant class in the chunk (the entry point is the biggest one)
-            const best = inChunk.sort((a, b) => classMembers(b.cls).size - classMembers(a.cls).size)[0];
-            return { name, cls: best.cls, via: 'chunk', key: best.key };
-        }
-        // anchor chunk not captured yet (loads late) — caller retries on next growth tick.
-        if (!sig.members) return { name, cls: null, via: 'none' };
+/** TIER 1 — classes declared in any captured chunk whose URL matches `re`. */
+export function classesInChunk(re: RegExp, client: ClientRegistry): Candidate[] {
+    const urls: string[] = g().__eqSourceUrls ?? [];
+    const out: Candidate[] = [];
+    for (let i = 0; i < urls.length; i++) {
+        if (re.test(urls[i])) out.push(...classesInModule(i, client));
     }
+    return out;
+}
 
-    // 2. fuzzy N-of-M over the live registry.
+/**
+ * TIER 2 — the import-graph walk. Find the entry/boot chunk (the one that defines the Vite
+ * `__vite__mapDeps` manifest, i.e. `index-*.js`), read the chunk filenames it dynamically
+ * `import("./X.js")`s, and return the classes declared in exactly those boot-imported chunks.
+ *
+ * This is the same idea as matching on the chunk NAME, but one level more robust: instead of
+ * trusting that the chunk is *named* "GameManager", we trust that the entry *boots* it via a
+ * dynamic import — which is true even if EQ ships hash-only chunk names. The signature (tier-3
+ * fuzzy, applied to this narrowed set by the caller) then picks the right one among them.
+ */
+export function classesViaImportGraph(client: ClientRegistry): Candidate[] {
+    const urls: string[] = g().__eqSourceUrls ?? [];
+    const mods: string[] = g().__eqSourceModules ?? [];
+
+    // entry chunk = the one carrying the Vite dep manifest; fall back to index-*.js by URL.
+    let entryIdx = mods.findIndex((m) => /__vite__mapDeps\s*=/.test(m));
+    if (entryIdx < 0) entryIdx = urls.findIndex((u) => /\/index-[\w]+\.js(\?|$)/.test(u));
+    if (entryIdx < 0) return [];
+
+    // chunk filenames the entry dynamically imports: import("./Foo-hash.js")
+    const wanted = new Set<string>();
+    for (const m of (mods[entryIdx] ?? '').matchAll(/import\(\s*["']\.?\/?([^"']+\.js)["']\s*\)/g)) {
+        wanted.add(fileOf(m[1]));
+    }
+    if (!wanted.size) return [];
+
+    // classes declared in those boot-imported chunks
+    const out: Candidate[] = [];
+    for (let i = 0; i < urls.length; i++) {
+        if (wanted.has(fileOf(urls[i]))) out.push(...classesInModule(i, client));
+    }
+    return out;
+}
+
+/** Fuzzy N-of-M over a candidate list. Returns the unique best, or null (logging ambiguity). */
+function fuzzyPick(name: string, sig: Signature, candidates: Iterable<Candidate>): ResolveResult {
     const members = sig.members ?? [];
     if (!members.length) return { name, cls: null, via: 'none' };
     const need = Math.ceil((sig.threshold ?? 0.6) * members.length);
 
     const scored: { key: string; cls: any; score: number }[] = [];
-    for (const [key, cls] of client) {
+    for (const { key, cls } of candidates) {
         const have = classMembers(cls);
         if (!have.size) continue;
         let score = 0;
@@ -96,17 +128,39 @@ export function resolveOne(name: string, sig: Signature, client: ClientRegistry)
     }
     if (!scored.length) return { name, cls: null, via: 'none' };
     scored.sort((a, b) => b.score - a.score);
-
-    // unique best? (a tie at the top means the signature isn't distinctive enough — fail loud)
     if (scored.length > 1 && scored[0].score === scored[1].score) {
         // eslint-disable-next-line no-console
-        console.error(`[Reflector] AMBIGUOUS ${name} -> ${scored.slice(0, 3).map(s => s.key).join(', ')} (tighten its signature)`);
+        console.error(`[Reflector] AMBIGUOUS ${name} -> ${scored.slice(0, 3).map((s) => s.key).join(', ')}`);
         return { name, cls: null, via: 'ambiguous' };
     }
     return { name, cls: scored[0].cls, via: 'fuzzy', key: scored[0].key };
 }
 
-/** Resolve a whole signature table. Returns only the ones that resolved this pass. */
+/** Resolve one signature to exactly one class via the cascade above. */
+export function resolveOne(name: string, sig: Signature, client: ClientRegistry): ResolveResult {
+    if (sig.chunk) {
+        // tier 1 — chunk-name anchor (dominant class in the named chunk)
+        const inChunk = classesInChunk(sig.chunk, client);
+        if (inChunk.length) {
+            const best = inChunk.sort((a, b) => classMembers(b.cls).size - classMembers(a.cls).size)[0];
+            return { name, cls: best.cls, via: 'chunk', key: best.key };
+        }
+        // tier 2 — import-graph walk: fuzzy-pick among the entry's boot-imported chunks
+        if (sig.members) {
+            const graph = fuzzyPick(name, sig, classesViaImportGraph(client));
+            if (graph.cls) return { ...graph, via: 'import-graph' };
+        }
+        // (anchor class not captured yet → caller retries on the next chunk-growth tick)
+        if (!sig.members) return { name, cls: null, via: 'none' };
+    }
+    // tier 3 — all-classes fuzzy (adapt the registry's [key,cls] tuples to {key,cls})
+    function* allCandidates(): Iterable<Candidate> {
+        for (const [key, cls] of client) yield { key, cls };
+    }
+    return fuzzyPick(name, sig, allCandidates());
+}
+
+/** Resolve a whole table; returns only the ones that resolved this pass. */
 export function resolveAll(
     signatures: Record<string, Signature>,
     client: ClientRegistry,
@@ -114,7 +168,7 @@ export function resolveAll(
 ): ResolveResult[] {
     const out: ResolveResult[] = [];
     for (const [name, sig] of Object.entries(signatures)) {
-        if (already.has(name)) continue;           // already bound — don't redo
+        if (already.has(name)) continue;
         const r = resolveOne(name, sig, client);
         if (r.cls) out.push(r);
     }
