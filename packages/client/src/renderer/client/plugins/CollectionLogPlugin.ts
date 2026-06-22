@@ -1,6 +1,7 @@
 import { Plugin } from '@evillite/core/src/interfaces/highlite/plugin/plugin.class';
 import { SettingsTypes } from '@evillite/core/src/interfaces/highlite/plugin/pluginSettings.interface';
 import { ModelIconCache } from '@evillite/core/src/utilities/modelIconCache';
+import { game } from '@evillite/core/src/reflector/gameAccess';
 
 /**
  * Collection Log / Drop Log (MVP) — tracks every item you EARN, in a bank-style UI, organised by
@@ -107,8 +108,10 @@ export default class CollectionLogPlugin extends Plugin {
     }
 
     private get isMobile(): boolean { return !!(window as any).EvilLiteMobile || (window as any).electron?.process?.platform === 'android' || (window as any).electron?.process?.platform === 'ios'; }
-    private get gm(): any { return this.gameHooks?.GameManager?.Instance ?? (window as any).gm ?? null; }
-    private get em(): any { return this.gameHooks?.EntityManager?.Instance ?? null; }
+    // Clean routes via the Reflector facade (core/reflector/gameAccess.ts) — resolved by
+    // signature, so these survive EvilQuest renaming/reshuffling the underlying classes.
+    private get gm(): any { return game.manager ?? (window as any).gm ?? null; }
+    private get em(): any { return game.entities; }
 
     private ensureData(): void {
         if (!this.data.log || typeof this.data.log !== 'object') this.data.log = {};
@@ -254,7 +257,9 @@ export default class CollectionLogPlugin extends Plugin {
     private npcName(id: number, em: any): string {
         const defId = em.npcDefs?.get(id); const def = em.npcDefsCache?.get(defId); return (def?.name ?? `NPC #${defId}`) + '';
     }
-    private itemDef(itemId: number): any { return this.em?.itemDefsCache?.get(itemId) ?? null; }
+    // `game.itemDefs` is the semantic route — it hides that EQ moved the item-def cache onto
+    // EntityManager. If they move it again, only gameAccess.ts changes, not this plugin.
+    private itemDef(itemId: number): any { return game.itemDefs?.get(itemId) ?? null; }
     private itemName(itemId: number): string { return (this.itemDef(itemId)?.name ?? `Item #${itemId}`) + ''; }
     /** The item's icon, matching what the inventory shows: its 2D icon if it ships one, otherwise
      *  EvilQuest's server-rendered 3D icon at `items/3d/<id>.png`. The game now serves these for

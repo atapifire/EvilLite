@@ -2,6 +2,7 @@ import { Plugin } from '@evillite/core/src/interfaces/highlite/plugin/plugin.cla
 import { SettingsTypes, type PluginSettings } from '@evillite/core/src/interfaces/highlite/plugin/pluginSettings.interface';
 import { PluginAssetCache } from '@evillite/core/src/utilities/pluginAssetCache';
 import { ModelIconCache } from '@evillite/core/src/utilities/modelIconCache';
+import { game } from '@evillite/core/src/reflector/gameAccess';
 
 /**
  * World Map plugin for EvilQuest.
@@ -394,13 +395,14 @@ export default class WorldMapPlugin extends Plugin {
 
     // ── Game data access (all by stable semantic names) ───────────────────────────
     private get gm(): any {
-        // Route through the Reflector: the GameManager instance is captured into
-        // gameHooks.GameManager.Instance by the HookManager (it's not a game-side
-        // singleton). Fall back to the raw global only until hooks have bound.
-        return this.gameHooks?.GameManager?.Instance ?? (window as any).gm ?? null;
+        // Clean route via the Reflector facade — resolves GameManager by signature/chunk-anchor,
+        // independent of how EvilQuest names/wires it (see core/reflector/gameAccess.ts). The
+        // raw-global fallback is vestigial (EQ removed window.gm) but harmless.
+        return game.manager ?? (window as any).gm ?? null;
     }
     private getChunkManager(): any {
-        return this.gm?.chunkManager ?? null;
+        // Prefer the signature-hooked ChunkManager; fall back to the manager's own reference.
+        return game.chunks ?? this.gm?.chunkManager ?? null;
     }
     private getMapId(): string {
         return this.getChunkManager()?.mapId ?? this.gm?.mapId ?? 'default';
